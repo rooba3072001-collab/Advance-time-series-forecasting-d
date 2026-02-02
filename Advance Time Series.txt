@@ -1,0 +1,170 @@
+# ============================================
+# Advanced Time Series Forecasting Project
+# ============================================
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+warnings.filterwarnings("ignore")
+
+# ============================================
+# 1. Synthetic Multivariate Dataset
+# ============================================
+
+np.random.seed(42)
+time_steps = 1200
+t = np.arange(time_steps)
+
+data = pd.DataFrame({
+    "energy": np.sin(0.02 * t) + np.random.normal(0, 0.05, time_steps),
+    "temperature": np.cos(0.015 * t),
+    "humidity": np.sin(0.01 * t)
+})
+
+# ============================================
+# 2. Scaling
+# ============================================
+
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(data)
+
+# ============================================
+# 3. Sequence Creation (Multi-Horizon)
+# ============================================
+
+def create_sequences(data, input_len=30, output_len=10):
+    X, y = [], []
+    for i in range(len(data) - input_len - output_len):
+        X.append(data[i:i+input_len])
+        y.append(data[i+input_len:i+input_len+output_len])
+    return np.array(X), np.array(y)
+
+X, y = create_sequences(scaled_data)
+
+split = int(0.8 * len(X))
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# ============================================
+# 4. Encoder–Decoder Transformer Model
+# ============================================
+
+def transformer_encoder(inputs, head_size, num_heads, ff_dim):
+    x = layers.MultiHeadAttention(num_heads=num_heads, key_dim=head_size)(
+        inputs, inputs
+    )
+    x = layers.Add()([x, inputs])
+    x = layers.LayerNormalization()(x)
+
+    ff = layers.Dense(ff_dim, activation="relu")(x)
+    ff = layers.Dense(inputs.shape[-1])(ff)
+    x = layers.Add()([x, ff])
+    return layers.LayerNormalization()(x)
+
+def transformer_decoder(inputs, enc_output, head_size, num_heads, ff_dim):
+    x = layers.MultiHeadAttention(num_heads=num_heads, key_dim=head_size)(
+        inputs, enc_output
+    )
+    x = layers.LayerNormalization()(x)
+
+    ff = layers.Dense(ff_dim, activation="relu")(x)
+    ff = layers.Dense(enc_output.shape[-1])(ff)
+    return layers.LayerNormalization()(ff)
+
+input_len = X_train.shape[1]
+num_features = X_train.shape[2]
+output_len = y_train.shape[1]
+
+encoder_inputs = layers.Input(shape=(input_len, num_features))
+encoder_outputs = transformer_encoder(
+    encoder_inputs, head_size=32, num_heads=4, ff_dim=64
+)
+
+decoder_inputs = layers.Input(shape=(output_len, num_features))
+decoder_outputs = transformer_decoder(
+    decoder_inputs, encoder_outputs, head_size=32, num_heads=4, ff_dim=64
+)
+
+final_outputs = layers.Dense(num_features)(decoder_outputs)
+
+transformer = models.Model(
+    inputs=[encoder_inputs, decoder_inputs],
+    outputs=final_outputs
+)
+
+transformer.compile(
+    optimizer="adam",
+    loss="mse"
+)
+
+# ============================================
+# 5. Train Transformer
+# ============================================
+
+transformer.fit(
+    [X_train, y_train],
+    y_train,
+    epochs=20,
+    batch_size=32,
+    validation_split=0.1,
+    verbose=1
+)
+
+# ============================================
+# 6. LSTM Baseline
+# ============================================
+
+lstm = models.Sequential([
+    layers.LSTM(64, return_sequences=False, input_shape=(input_len, num_features)),
+    layers.Dense(output_len * num_features),
+    layers.Reshape((output_len, num_features))
+])
+
+lstm.compile(optimizer="adam", loss="mse")
+lstm.fit(X_train, y_train, epochs=20, batch_size=32, verbose=0)
+
+# ============================================
+# 7. SARIMA Baseline (Univariate on Energy)
+# ============================================
+
+train_energy = data["energy"][:split+30]
+test_energy = data["energy"][split+30:]
+
+sarima = SARIMAX(train_energy, order=(2,1,2), seasonal_order=(1,0,1,50))
+sarima_fit = sarima.fit(disp=False)
+
+sarima_preds = sarima_fit.forecast(steps=len(test_energy))
+
+# ============================================
+# 8. Multi-Horizon Evaluation
+# ============================================
+
+def evaluate(y_true, y_pred, step):
+    yt = y_true[:, step-1, :]
+    yp = y_pred[:, step-1, :]
+    mae = mean_absolute_error(yt, yp)
+    rmse = np.sqrt(mean_squared_error(yt, yp))
+    mape = np.mean(np.abs((yt - yp) / yt)) * 100
+    return mae, rmse, mape
+
+transformer_preds = transformer.predict([X_test, y_test])
+lstm_preds = lstm.predict(X_test)
+
+print("\n--- TRANSFORMER PERFORMANCE ---")
+for h in [1, 5, 10]:
+    mae, rmse, mape = evaluate(y_test, transformer_preds, h)
+    print(f"{h}-Step -> MAE:{mae:.4f}, RMSE:{rmse:.4f}, MAPE:{mape:.2f}%")
+
+print("\n--- LSTM PERFORMANCE ---")
+for h in [1, 5, 10]:
+    mae, rmse, mape = evaluate(y_test, lstm_preds, h)
+    print(f"{h}-Step -> MAE:{mae:.4f}, RMSE:{rmse:.4f}, MAPE:{mape:.2f}%")
+
+print("\n--- SARIMA PERFORMANCE (Energy Only) ---")
+sarima_rmse = np.sqrt(mean_squared_error(test_energy, sarima_preds))
+print("RMSE:", sarima_rmse)
